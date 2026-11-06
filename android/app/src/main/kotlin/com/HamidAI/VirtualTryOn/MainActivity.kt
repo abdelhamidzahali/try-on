@@ -1,4 +1,4 @@
-package com.mycompany.CounterApp
+package com.HamidAI.VirtualTryOn
 
 import io.flutter.embedding.android.FlutterActivity
 
