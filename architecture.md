@@ -1,90 +1,80 @@
-# AI Outfit Try-On App Architecture
+# EnvisionFit Architecture
 
-## App Overview
-**EnvisionFit** is an AI-powered virtual outfit try-on app that allows users to take photos of themselves and virtually try on clothing items using advanced AI image generation technology.
+## Overview
+**EnvisionFit** is a Flutter app (package `envisionfit`) for AI virtual outfit try-on. A user signs in, picks a gender, saves a selfie and a full-body photo, then uploads a photo of a garment. The app describes the garment, checks it matches the user's gender, and generates an image of the user wearing it.
 
-## Core Features & MVP
-1. **Photo Capture & Selection**
-   - Camera integration for taking user photos
-   - Gallery picker for selecting existing photos
-   - Photo crop/adjustment tools
+All AI work runs on the backend: the app calls **Supabase Edge Functions**, which call **Google Gemini** (the try-on provider is labelled Gemini 2.5 Flash Image in `lib/services/ai/ai_providers.dart`). The Edge Function source is not in this repository; this document covers the client side and the contracts it relies on.
 
-2. **Outfit Selection**
-   - Photo capture/selection for clothing items
-   - Clothing category management
-   - Outfit gallery with sample clothes
+```
+Flutter app ──► Supabase Auth (Google OAuth)
+            ──► Supabase Postgres (`users` table)
+            ──► Supabase Edge Functions ──► Gemini
+                  ├─ profile_photo_validation
+                  ├─ Describ_Garment
+                  ├─ tryon-upload-urls  ──► Supabase Storage (signed URLs)
+                  └─ tryon
+            ──► SharedPreferences (local history, galleries, favorites, profile)
+```
 
-3. **AI Image Generation**
-   - OpenAI integration for virtual try-on
-   - Image processing and optimization
-   - Result generation and preview
+## User flow
+1. **Welcome** (`onboarding_welcome_screen.dart`): Google sign-in through `SupabaseConfig.auth.signInWithOAuth(OAuthProvider.google)`, redirecting back to `Uri.base.origin`. On sign-in the app upserts `{id, name, email}` into the `users` table. A "Continue as Guest" option skips sign-in.
+2. **Gender selection** (`gender_selection_screen.dart`): Gentleman or Lady.
+3. **Selfie** (`onboarding_photos_screen.dart`) and **full-body photo** (`onboarding_fullbody_screen.dart`): each photo is checked by the `profile_photo_validation` Edge Function, which rejects bad photos and detects gender so the app can block a mismatch with the selected gender. When the remote check returns nothing (for example for guests or offline), the app falls back to `LocalPhotoValidator` (on-device resolution checks). Photos go into local galleries.
+4. **Registration** (`UserRegistrationService.completeRegistration`): stores the profile in SharedPreferences and, when signed in, updates the `users` row.
+5. **Main tabs** (`navigation/root_tabs.dart`): Home (Try-On), Favorites, Settings. Each tab has its own nested `Navigator`; `AppNavigator` holds the global navigator key and a `tabIndex` notifier.
+6. **Try-On** (`tryon_screen.dart`): user uploads a garment photo (camera or gallery). `ClothingDescriptionService` calls `Describ_Garment`, parses category, name and gender, and blocks the try-on if the garment's gender doesn't match the user's.
+7. **Results** (`results_screen.dart`): creates and processes a `TryOnSession`, shows the generated image, and lets the user save/download it, favorite it, or try another outfit.
+8. **Settings** (`settings_screen.dart`): replace the selfie or full-body photo (re-validated the same way), and sign out.
 
-4. **Results Management**
-   - Generated image display
-   - Save/share functionality
-   - History of previous try-ons
+Note: `main.dart` currently has `_previewOnboarding = true`, so the app always starts on the Welcome screen. Set it to `false` to resume at the main tabs once onboarding is complete.
 
-## Technical Architecture
+## Supabase backend
 
-### Data Models (`lib/models/`)
-1. **User** - Basic user profile data
-2. **TryOnSession** - Individual try-on sessions with user photo, clothing photo, and generated result
-3. **ClothingItem** - Clothing piece metadata (category, color, brand, etc.)
-4. **GeneratedImage** - AI-generated result with metadata
+### Configuration
+`lib/supabase/supabase_config.dart` holds the project URL and anon key and initialises the client in `main()`. It also defines a generic `SupabaseService` CRUD helper and table helpers (`SupabaseUserService`, `SupabaseClothingService`, `SupabaseTryOnService`, `SupabaseGeneratedImageService`). Only `SupabaseUserService` is used today.
 
-### Services (`lib/services/`)
-1. **ImageService** - Handle camera, gallery, and image processing
-2. **TryOnService** - Manage try-on sessions and local storage
-3. **AIService** - OpenAI integration for virtual try-on generation
-4. **ClothingService** - Manage clothing items and categories
+### Edge Functions (called with `client.functions.invoke`)
+| Function | Caller | Request | Response used by the app |
+|---|---|---|---|
+| `profile_photo_validation` | `PhotoValidationService.validateBytes` | `imageBase64`, `photoType` (`selfie` / `fullbody`) | `{gender, status: "OK" \| "NOT OK", reason}`, possibly nested under `result`/`data`/`output` or as a JSON string |
+| `Describ_Garment` | `ClothingDescriptionService.describeClothing` | `clothing_image_base64`, `mime_type` | `{description}` (or plain text) whose first three lines are category, name, and gender (Gentleman / Lady) |
+| `tryon-upload-urls` | `StorageService.uploadTryOnInputsAndGetUrls` | `user_id`, `timestamp` | `model_upload_url`, `cloth_upload_url`, `model_read_url`, `cloth_read_url` (signed Storage URLs) |
+| `tryon` | `GeminiSupabaseTryOnProvider.generateComposite` | model and garment images (as URLs or base64), `clothing_category`, `clothing_name`, `clothing_gender`, `mode: "virtual_tryon"`, `prompt` | a result image URL (`result_image_url`, `image_url`, ...) or base64 image, plus optional `clothing_description` and the prompt the backend used |
 
-### UI Architecture (`lib/screens/`)
-1. **HomePage** - Main dashboard with recent try-ons and quick actions
-2. **CameraScreen** - Camera interface for capturing user photos
-3. **OutfitSelectionScreen** - Choose/capture clothing items
-4. **TryOnScreen** - Main try-on interface with AI generation
-5. **ResultsScreen** - Display generated results with save/share options
-6. **HistoryScreen** - View previous try-on sessions
+### Try-on generation path
+`GeminiSupabaseTryOnProvider` (`lib/services/ai/gemini_supabase_provider.dart`):
+1. **URL path (preferred):** get signed upload URLs from `tryon-upload-urls`, `PUT` both JPEGs straight to Supabase Storage, then call `tryon` with the signed read URLs.
+2. **Base64 fallback:** if the upload or URL call fails, call `tryon` again with both images base64-encoded.
+3. **Response parsing:** accepts a result URL first, then base64 in common keys, nested `result`/`data`/`output`, or any data-URL-like string. Returns a `TryOnGeneration` with either `url` or `bytes`, plus `usedPrompt` and `clothingDescription`.
 
-### Widgets (`lib/widgets/`)
-- **PhotoCaptureCard** - Reusable photo capture component
-- **OutfitCard** - Display clothing items
-- **ResultCard** - Show generated try-on results
-- **LoadingOverlay** - AI processing loading state
-- **ActionButton** - Consistent button styling
+The provider sits behind the `TryOnAiProvider` interface (`analyzeStyle`, `generateComposite`), and `AiProviders.current` picks the active one. The Gemini provider returns `null` from `analyzeStyle`, so there is no separate style-analysis step.
 
-## Design System
-- **Modern, sleek UI** with generous spacing
-- **Elegant fonts** (Inter) with proper hierarchy
-- **Sophisticated monochrome palette** with one accent color
-- **Flat design** with rounded corners
-- **Card-based layouts** for content organization
-- **No Material Design patterns**
+### Database
+Schema and RLS policies are in `lib/supabase/supabase_tables.sql` and `supabase_policies.sql` (generated types in `database.types.ts`). Tables: `users`, `clothing_items`, `generated_images`, `tryon_sessions`, each with RLS limited to `auth.uid()`.
 
-## Implementation Steps
-1. Set up dependencies and permissions
-2. Create data models with local storage
-3. Implement service classes with sample data
-4. Build core UI screens and components
-5. Integrate camera and gallery functionality  
-6. Add OpenAI AI image generation
-7. Implement results display and storage
-8. Add history and sharing features
-9. Polish UI/UX and add animations
-10. Test and debug the complete app
+In practice the app only reads and writes `users`. It also writes `gender`, `selfieImagePath`, `fullBodyImagePath`, `createdAt` and `updatedAt`, which are not in the checked-in SQL. Those columns either exist only in the live project or the writes fail; `UserRegistrationService` retries with a minimal payload when that happens. The checked-in SQL should be synced with the live schema.
 
-## Storage Strategy
-- **Local Storage** using SharedPreferences for:
-  - User preferences
-  - Try-on session history
-  - Cached clothing items
-- **File System** for storing:
-  - User photos
-  - Clothing photos
-  - Generated AI results
+## Local storage (SharedPreferences)
+Try-on history and photos stay on the device:
 
-## AI Integration
-- **OpenAI GPT-4o** for image generation
-- **Custom prompts** for virtual outfit try-on
-- **Image processing** for optimal results
-- **Error handling** and retry mechanisms
+| Service | Key | Contents |
+|---|---|---|
+| `OnboardingService` | `onboarding_completed_v1`, `profile_*_v1` | completion flag, name, email, gender, selfie and full-body paths |
+| `ModelGalleryService` | `model_images_v1` | selfie gallery with a default image |
+| `FullBodyGalleryService` | `fullbody_images_v1` | full-body gallery with a default image |
+| `TryOnService` | `tryon_sessions` | try-on sessions, capped at the 8 most recent |
+| `TryOnFavoritesService` | `favorite_tryon_ids` | favorited session ids |
+| `ClothingService` | `clothing_items` | sample clothing catalog (not used by the current UI) |
+
+When `tryon` returns a URL the session stores it. When it returns bytes, `ImageService.saveBytesToImageFile` saves them locally (data URLs on web). `DownloadSaver` uses `image_gallery_saver` on mobile and a browser download on web.
+
+## Code layout
+- `lib/models/`: `User`, `TryOnSession` (status: pending, processing, completed, failed, plus clothing metadata), `GeneratedImage`, `ClothingItem`, `ModelImage`.
+- `lib/services/`: the services above, plus `ImageService` (camera, gallery, permissions, bytes and file helpers) and `ai/` (provider interface, Gemini provider, `TryOnGeneration`).
+- `lib/supabase/`: client config, Storage upload helper, SQL schema, policies, sample data, types.
+- `lib/screens/`, `lib/widgets/`: UI. Main widgets: `PhotoCaptureCard`, `AnimatedPreparing`, `ResultCard`, `OutfitCard`, `TitleText`.
+- `lib/theme.dart`: light and dark themes using Inter for body text and Playfair Display for headings.
+
+## Legacy and unused code
+- `lib/openai/openai_config.dart`: the original OpenAI implementation (`OpenAIService`, `OpenAiTryOnProvider`, GPT-4o and gpt-image-1 through a Dreamflow proxy). It is no longer wired in.
+- `HomePage`, `HistoryScreen`, `RetailSearchService` (SHEIN search links), `ClothingService` and the unused Supabase table helpers have no callers in the current navigation.
