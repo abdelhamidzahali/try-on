@@ -5,6 +5,7 @@ import 'package:envisionfit/services/ai/tryon_generation.dart';
 import 'package:envisionfit/supabase/supabase_config.dart';
 import 'package:envisionfit/supabase/storage_service.dart';
 import 'package:flutter/foundation.dart';
+import 'package:supabase_flutter/supabase_flutter.dart' show FunctionException;
 
 /// Gemini 2.5 Flash Image try-on provider via Supabase Edge Function
 class GeminiSupabaseTryOnProvider extends TryOnAiProvider {
@@ -46,32 +47,38 @@ class GeminiSupabaseTryOnProvider extends TryOnAiProvider {
       if (urls != null) {
         debugPrint('[Gemini] Invoking Edge Function with signed URLs');
         final invokeSw = Stopwatch()..start();
-        final resUrl = await SupabaseConfig.client.functions.invoke(
-          'tryon',
-          body: {
-            // Primary keys
-            'model_image_url': urls.modelUrl,
-            'cloth_image_url': urls.clothUrl,
-            // Compatibility aliases used by some functions
-            'user_image_url': urls.modelUrl,
-            'garment_image_url': urls.clothUrl,
-            'clothing_image_url': urls.clothUrl,
-            // Pre-computed clothing metadata
-            if (clothingCategory != null) 'clothing_category': clothingCategory,
-            if (clothingName != null) 'clothing_name': clothingName,
-            if (clothingGender != null) 'clothing_gender': clothingGender,
-            // Hints
-            'mode': 'virtual_tryon',
-            'return_original': false,
-            'prompt': styleAnalysis ?? 'Generate a realistic virtual try-on image',
-          },
-        );
-        status = resUrl.status;
-        debugPrint('[Gemini] URL invoke completed in ${invokeSw.elapsedMilliseconds}ms (status $status)');
-        if (status == 200) {
-          data = resUrl.data;
-        } else {
-          debugPrint('[Gemini] URL path failed (${resUrl.status}). Falling back to base64. Body: ${resUrl.data}');
+        // functions.invoke throws on non-2xx, so catch it here to reach the
+        // base64 fallback below instead of aborting the whole request.
+        try {
+          final resUrl = await SupabaseConfig.client.functions.invoke(
+            'tryon',
+            body: {
+              // Primary keys
+              'model_image_url': urls.modelUrl,
+              'cloth_image_url': urls.clothUrl,
+              // Compatibility aliases used by some functions
+              'user_image_url': urls.modelUrl,
+              'garment_image_url': urls.clothUrl,
+              'clothing_image_url': urls.clothUrl,
+              // Pre-computed clothing metadata
+              if (clothingCategory != null) 'clothing_category': clothingCategory,
+              if (clothingName != null) 'clothing_name': clothingName,
+              if (clothingGender != null) 'clothing_gender': clothingGender,
+              // Hints
+              'mode': 'virtual_tryon',
+              'return_original': false,
+              'prompt': styleAnalysis ?? 'Generate a realistic virtual try-on image',
+            },
+          );
+          status = resUrl.status;
+          debugPrint('[Gemini] URL invoke completed in ${invokeSw.elapsedMilliseconds}ms (status $status)');
+          if (status == 200) {
+            data = resUrl.data;
+          } else {
+            debugPrint('[Gemini] URL path failed (${resUrl.status}). Falling back to base64. Body: ${resUrl.data}');
+          }
+        } on FunctionException catch (e) {
+          debugPrint('[Gemini] URL path failed (${e.status}). Falling back to base64. Body: ${e.details}');
         }
       } else {
         debugPrint('[Gemini] Skipping URL path; upload failed. Using base64 fallback.');

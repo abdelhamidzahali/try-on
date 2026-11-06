@@ -15,7 +15,13 @@ class SupabaseConfig {
     );
   }
 
-  static SupabaseClient get client => Supabase.instance.client;
+  /// Test-only hook: when set, [client] returns this instead of the global
+  /// `Supabase.instance.client`, so tests can inject a client backed by a
+  /// mock HTTP transport without calling [initialize].
+  @visibleForTesting
+  static SupabaseClient? clientOverride;
+
+  static SupabaseClient get client => clientOverride ?? Supabase.instance.client;
   static GoTrueClient get auth => client.auth;
 }
 
